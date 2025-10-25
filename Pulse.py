@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 NV10 Parallel Mode Controller pentru Raspberry Pi
-Versiune: 1.0
+Versiune: 1.1 - Fixed GPIO edge detection
 """
 
 import RPi.GPIO as GPIO
@@ -14,7 +14,6 @@ import sys
 # ============================================
 # CONFIGURARE PINI GPIO
 # ============================================
-# Folosim numerotare BCM (GPIO pin numbers)
 VEND1_PIN = 17  # GPIO 17 (Pin 11 fizic) - Canal 1
 VEND2_PIN = 27  # GPIO 27 (Pin 13 fizic) - Canal 2
 VEND3_PIN = 22  # GPIO 22 (Pin 15 fizic) - Canal 3
@@ -37,6 +36,7 @@ CHANNEL_VALUES = {
 PULSE_MIN_TIME = 0.050  # 50ms
 PULSE_MAX_TIME = 0.500  # 500ms
 DEBOUNCE_TIME = 0.100   # 100ms
+POLL_INTERVAL = 0.001   # 1ms pentru polling
 
 # ============================================
 # VARIABILE GLOBALE
@@ -54,11 +54,15 @@ class NV10Controller:
     """Controller pentru NV10 în modul Parallel"""
     
     def __init__(self):
-        self.setup_gpio()
         self.last_pulse_time = {1: 0, 2: 0, 3: 0, 4: 0}
+        self.last_state = {1: GPIO.HIGH, 2: GPIO.HIGH, 3: GPIO.HIGH, 4: GPIO.HIGH}
+        self.setup_gpio()
         
     def setup_gpio(self):
         """Configurare pini GPIO"""
+        # Cleanup GPIO existent
+        GPIO.cleanup()
+        
         GPIO.setmode(GPIO.BCM)
         GPIO.setwarnings(False)
         
@@ -69,64 +73,66 @@ class NV10Controller:
         GPIO.setup(VEND4_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         GPIO.setup(BUSY_PIN, GPIO.IN, pull_up_down=GPIO.PUD_UP)
         
-        # Adaugă detectare evenimente pe falling edge
-        GPIO.add_event_detect(VEND1_PIN, GPIO.FALLING, 
-                             callback=lambda ch: self.pulse_detected(1, VEND1_PIN),
-                             bouncetime=int(DEBOUNCE_TIME * 1000))
-        
-        GPIO.add_event_detect(VEND2_PIN, GPIO.FALLING,
-                             callback=lambda ch: self.pulse_detected(2, VEND2_PIN),
-                             bouncetime=int(DEBOUNCE_TIME * 1000))
-        
-        GPIO.add_event_detect(VEND3_PIN, GPIO.FALLING,
-                             callback=lambda ch: self.pulse_detected(3, VEND3_PIN),
-                             bouncetime=int(DEBOUNCE_TIME * 1000))
-        
-        GPIO.add_event_detect(VEND4_PIN, GPIO.FALLING,
-                             callback=lambda ch: self.pulse_detected(4, VEND4_PIN),
-                             bouncetime=int(DEBOUNCE_TIME * 1000))
+        print("✓ GPIO configurat\n")
     
-    def pulse_detected(self, channel, pin):
-        """Callback când se detectează un puls"""
+    def check_channel(self, channel, pin):
+        """Verifică un canal pentru pulsuri (polling method)"""
         global total_bills, total_amount, channel_counts, bill_history
         
-        # Verifică debounce
-        current_time = time.time()
-        if current_time - self.last_pulse_time[channel] < DEBOUNCE_TIME:
-            return
+        current_state = GPIO.input(pin)
         
-        # Măsoară durata pulsului
-        pulse_start = time.time()
-        
-        # Așteaptă să revină la HIGH (sfârșitul pulsului)
-        timeout = pulse_start + PULSE_MAX_TIME * 2
-        while GPIO.input(pin) == GPIO.LOW and time.time() < timeout:
-            time.sleep(0.001)
-        
-        pulse_duration = time.time() - pulse_start
-        
-        # Verifică dacă pulsul e valid
-        if PULSE_MIN_TIME <= pulse_duration <= PULSE_MAX_TIME:
-            value = CHANNEL_VALUES[channel]
+        # Detectează falling edge (HIGH -> LOW)
+        if current_state == GPIO.LOW and self.last_state[channel] == GPIO.HIGH:
+            current_time = time.time()
             
-            # Actualizează statistici (thread-safe)
-            with stats_lock:
-                total_bills += 1
-                total_amount += value
-                channel_counts[channel] += 1
-                bill_history.append({
-                    'time': datetime.now(),
-                    'channel': channel,
-                    'value': value,
-                    'pulse_duration': pulse_duration
-                })
+            # Verifică debounce
+            if current_time - self.last_pulse_time[channel] < DEBOUNCE_TIME:
+                self.last_state[channel] = current_state
+                return
             
-            # Afișează mesaj
-            self.display_bill_accepted(channel, value, pulse_duration)
+            # Măsoară durata pulsului
+            pulse_start = time.time()
             
-            self.last_pulse_time[channel] = current_time
-        else:
-            print(f"⚠ Puls invalid pe canal {channel}: {pulse_duration*1000:.0f}ms")
+            # Așteaptă să revină la HIGH
+            timeout = pulse_start + PULSE_MAX_TIME * 2
+            while GPIO.input(pin) == GPIO.LOW and time.time() < timeout:
+                time.sleep(0.001)
+            
+            pulse_duration = time.time() - pulse_start
+            
+            # Verifică dacă pulsul e valid
+            if PULSE_MIN_TIME <= pulse_duration <= PULSE_MAX_TIME:
+                value = CHANNEL_VALUES[channel]
+                
+                # Actualizează statistici (thread-safe)
+                with stats_lock:
+                    total_bills += 1
+                    total_amount += value
+                    channel_counts[channel] += 1
+                    bill_history.append({
+                        'time': datetime.now(),
+                        'channel': channel,
+                        'value': value,
+                        'pulse_duration': pulse_duration
+                    })
+                
+                # Afișează mesaj
+                self.display_bill_accepted(channel, value, pulse_duration)
+                
+                self.last_pulse_time[channel] = current_time
+            else:
+                print(f"⚠ Puls invalid pe canal {channel}: {pulse_duration*1000:.0f}ms")
+        
+        self.last_state[channel] = current_state
+    
+    def poll_channels(self):
+        """Polling continuu pentru toate canalele"""
+        while running:
+            self.check_channel(1, VEND1_PIN)
+            self.check_channel(2, VEND2_PIN)
+            self.check_channel(3, VEND3_PIN)
+            self.check_channel(4, VEND4_PIN)
+            time.sleep(POLL_INTERVAL)
     
     def display_bill_accepted(self, channel, value, pulse_duration):
         """Afișează mesaj pentru bancnotă acceptată"""
@@ -167,7 +173,7 @@ def print_header():
     print()
     print("╔════════════════════════════════════════╗")
     print("║  NV10 Controller - Raspberry Pi       ║")
-    print("║  Parallel Mode - Version 1.0          ║")
+    print("║  Parallel Mode - Version 1.1          ║")
     print("╚════════════════════════════════════════╝")
     print()
 
@@ -282,7 +288,8 @@ def status_thread():
     
     while running:
         if time.time() - last_status > 60:  # La 60 secunde
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] Alive | Total: {total_amount} RON")
+            with stats_lock:
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Alive | Total: {total_amount} RON ({total_bills} bancnote)")
             last_status = time.time()
         
         time.sleep(1)
@@ -301,7 +308,6 @@ if __name__ == "__main__":
     # Inițializare controller
     print("Inițializare GPIO...")
     controller = NV10Controller()
-    print("✓ GPIO configurat\n")
     
     # Afișează configurație
     print("Configurare pini (BCM numbering):")
@@ -328,6 +334,9 @@ if __name__ == "__main__":
     print()
     
     # Pornește thread-uri
+    poll_thread = threading.Thread(target=controller.poll_channels, daemon=True)
+    poll_thread.start()
+    
     cmd_thread = threading.Thread(target=command_thread, daemon=True)
     cmd_thread.start()
     
@@ -344,6 +353,9 @@ if __name__ == "__main__":
     
     finally:
         # Cleanup
+        running = False
+        time.sleep(0.5)  # Așteaptă thread-urile să termine
+        
         print("\nCurățare GPIO...")
         controller.cleanup()
         print("✓ GPIO cleanup complet")
